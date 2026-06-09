@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+import subprocess
+import threading
+import sys
+from pathlib import Path
+import re
+import webbrowser
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+try:
+    import tkinter as tk
+    from tkinter import scrolledtext
+except Exception:
+    print("Tkinter is required for the GUI. Install tkinter in your venv.")
+    raise
+
+
+def find_venv_python():
+    # common venv locations
+    candidates = [Path('.venv') / 'bin' / 'python', Path('venv') / 'bin' / 'python']
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    # fallback to system python
+    return sys.executable
+
+
+class ScraperGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title('Scraper Starter')
+        self.geometry('640x360')
+
+        tk.Label(self, text='Symbol:').grid(row=0, column=0, sticky='w', padx=6, pady=6)
+        self.sym_entry = tk.Entry(self)
+        self.sym_entry.insert(0, 'USDCAD')
+        self.sym_entry.grid(row=0, column=1, sticky='ew', padx=6)
+
+        tk.Label(self, text='Exchange:').grid(row=1, column=0, sticky='w', padx=6, pady=6)
+        self.exchange_entry = tk.Entry(self)
+        self.exchange_entry.insert(0, 'OANDA')
+        self.exchange_entry.grid(row=1, column=1, sticky='ew', padx=6)
+
+        tk.Label(self, text='Out dir (optional):').grid(row=2, column=0, sticky='w', padx=6, pady=6)
+        self.out_entry = tk.Entry(self)
+        self.out_entry.insert(0, 'scraping')
+        self.out_entry.grid(row=2, column=1, sticky='ew', padx=6)
+
+        # Existing scraping folders selector
+        tk.Label(self, text='Existing data:').grid(row=3, column=0, sticky='w', padx=6, pady=6)
+        self.existing_var = tk.StringVar(value='')
+        self.existing_menu = tk.OptionMenu(self, self.existing_var, '')
+        self.existing_menu.grid(row=3, column=1, sticky='ew', padx=6)
+
+        self.show_trend_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(self, text='Show trend (after scrape)', variable=self.show_trend_var).grid(row=4, column=0, columnspan=2, sticky='w', padx=6)
+
+        start_btn = tk.Button(self, text='Start Scrape', command=self.start_scrape)
+        start_btn.grid(row=5, column=0, columnspan=2, pady=8)
+
+        show_existing_btn = tk.Button(self, text='Show trend (existing)', command=self.show_trend_existing)
+        show_existing_btn.grid(row=6, column=0, columnspan=2, pady=0)
+
+        dashboard_btn = tk.Button(self, text='Generate & Open Dashboard', command=self.generate_and_open_dashboard)
+        dashboard_btn.grid(row=7, column=0, columnspan=2, pady=0)
+
+        self.log = scrolledtext.ScrolledText(self, state='disabled', height=12)
+        self.log.grid(row=8, column=0, columnspan=2, sticky='nsew', padx=6, pady=6)
+
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(8, weight=1)
+
+        self.venv_python = find_venv_python()
+        self.write_log(f'Using Python: {self.venv_python}\n')
+
+        # populate existing scraping folders
+        self.refresh_existing_dirs()
+
+    def write_log(self, text: str):
+        self.log.configure(state='normal')
+        self.log.insert('end', text)
+        self.log.see('end')
+        self.log.configure(state='disabled')
+
+    def refresh_existing_dirs(self):
+        base = Path(self.out_entry.get().strip() or 'scraping')
+        menu = self.existing_menu['menu']
+        menu.delete(0, 'end')
+        if not base.exists():
+            self.existing_var.set('')
+            return
+        dirs = sorted([d.name for d in base.iterdir() if d.is_dir()], reverse=True)
+        if not dirs:
+            self.existing_var.set('')
+            menu.add_command(label='(no folders)', command=lambda: self.existing_var.set(''))
+            return
+        for d in dirs:
+            menu.add_command(label=d, command=lambda v=d: self.existing_var.set(v))
+        # set default selection
+        self.existing_var.set(dirs[0])
+
+    def run_trend_analyzer(self, data_dir: Path):
+        """Run the trend analyzer on data_dir, log its stdout, and summarize any verdict changes."""
+        trend_script = Path('src/analytics/trend.py')
+        if not trend_script.exists():
+            self.write_log(f'⚠️ Trend-Skript nicht gefunden unter {trend_script}\n')
+            return
+
+        cmd = [self.venv_python, str(trend_script), '--data-dir', str(data_dir)]
+        self.write_log('Running trend analyzer: ' + ' '.join(cmd) + '\n')
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        out_lines = []
+        for line in proc.stdout:
+            out_lines.append(line.rstrip('\n'))
+            self.write_log(line)
+        proc.wait()
+        self.write_log(f'Trend analyzer exited with {proc.returncode}\n')
+
+        # Parse report lines to detect transitions like 'bearish into bullish'
+        transitions = []
+        import re
+        # Look for lines with: label verdict prev delta ...
+        row_re = re.compile(r"^(\S+)\s+(bullish|bearish)\s+(\S+)\s+(\*| )\s+")
+        for l in out_lines:
+            m = row_re.match(l)
+            if m:
+                label = m.group(1)
+                verdict = m.group(2)
+                prev = m.group(3)
+                delta = m.group(4)
+                if prev != '-' and prev != verdict:
+                    transitions.append(f"{label}: {prev} into {verdict}")
+
+        if transitions:
+            self.write_log('\nSummary of changes:\n')
+            for t in transitions:
+                self.write_log('  ' + t + '\n')
+        else:
+            self.write_log('\nNo verdict changes detected.\n')
+
+    def start_scrape(self):
+        symbol = self.sym_entry.get().strip()
+        exchange = self.exchange_entry.get().strip()
+        outdir = self.out_entry.get().strip() or 'scraping'
+
+        cmd = [self.venv_python, 'data/scraper.py', '--symbol', symbol, '--exchange', exchange, '--outdir', outdir]
+        if self.show_trend_var.get():
+            cmd.append('--show-trend')
+        self.write_log('Running: ' + ' '.join(cmd) + '\n')
+
+        def run():
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            out_dir = None
+            for line in proc.stdout:
+                self.write_log(line)
+                m = re.search(r"Schreibe Ausgabedateien nach:\s*(.+)", line)
+                if m:
+                    out_dir = m.group(1).strip()
+            proc.wait()
+            self.write_log(f'Process exited with {proc.returncode}\n')
+
+            # If requested, run the canonical trend analyzer and show its output
+            if self.show_trend_var.get():
+                if out_dir is None:
+                    self.write_log('⚠️ Konnte Ausgabepfad nicht erkennen; kein Trend-Report.\n')
+                    return
+                trend_script = Path('src/analytics/trend.py')
+                if not trend_script.exists():
+                    self.write_log(f'⚠️ Trend-Skript nicht gefunden unter {trend_script}\n')
+                    return
+                try:
+                    # use shared helper that also summarizes transitions
+                    self.run_trend_analyzer(Path(out_dir))
+                except Exception as e:
+                    self.write_log(f'Fehler beim Starten des Trend-Analyzers: {e}\n')
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+
+    def show_trend_existing(self):
+        sel = self.existing_var.get().strip()
+        base = Path(self.out_entry.get().strip() or 'scraping')
+        if not sel:
+            self.write_log('⚠️ Kein vorhandener Ordner ausgewählt. Bitte zuerst einen Ordner wählen.\n')
+            return
+        data_dir = base / sel
+        if not data_dir.exists():
+            self.write_log(f'⚠️ Ausgewählter Ordner nicht gefunden: {data_dir}\n')
+            return
+
+        def run_trend():
+            trend_script = Path('src/analytics/trend.py')
+            if not trend_script.exists():
+                self.write_log(f'⚠️ Trend-Skript nicht gefunden unter {trend_script}\n')
+                return
+            cmd = [self.venv_python, str(trend_script), '--data-dir', str(data_dir)]
+            self.write_log('Running trend analyzer: ' + ' '.join(cmd) + '\n')
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            out_lines = []
+            for line in proc.stdout:
+                out_lines.append(line.rstrip('\n'))
+                self.write_log(line)
+            proc.wait()
+            self.write_log(f'Trend analyzer exited with {proc.returncode}\n')
+
+            # summarize transitions
+            # parse the printed report lines
+            import re
+            transitions = []
+            row_re = re.compile(r"^(\S+)\s+(bullish|bearish)\s+(\S+)\s+(\*| )\s+")
+            for l in out_lines:
+                m = row_re.match(l)
+                if m:
+                    label = m.group(1)
+                    verdict = m.group(2)
+                    prev = m.group(3)
+                    if prev != '-' and prev != verdict:
+                        transitions.append(f"{label}: {prev} into {verdict}")
+            if transitions:
+                self.write_log('\nSummary of changes:\n')
+                for t in transitions:
+                    self.write_log('  ' + t + '\n')
+            else:
+                self.write_log('\nNo verdict changes detected.\n')
+
+        threading.Thread(target=run_trend, daemon=True).start()
+
+    def generate_and_open_dashboard(self):
+        """Generate dashboard from Daily timeframe and open in browser."""
+        def run():
+            dashboard_script = Path('src/analytics/dashboard.py')
+            if not dashboard_script.exists():
+                self.write_log(f'⚠️ Dashboard-Skript nicht gefunden unter {dashboard_script}\n')
+                return
+
+            # prefer unified dashboard CLI; pass --data-dir if a specific existing folder is selected
+            cmd = [self.venv_python, str(dashboard_script), '--mode', 'combined']
+            sel = self.existing_var.get().strip()
+            base = Path(self.out_entry.get().strip() or 'scraping')
+            if sel:
+                data_dir = base / sel
+                cmd += ['--data-dir', str(data_dir)]
+
+            self.write_log('Generating dashboard: ' + ' '.join(cmd) + '\n')
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            dashboard_file = None
+            out_lines = []
+            for line in proc.stdout:
+                out_lines.append(line.rstrip('\n'))
+                self.write_log(line)
+                m = re.search(r'✅ Merged dashboard created:\s*(.+)', line)
+                if m:
+                    dashboard_file = m.group(1).strip()
+                m2 = re.search(r'✅ Dashboard created:\s*(.+)', line)
+                if m2:
+                    dashboard_file = m2.group(1).strip()
+            proc.wait()
+            self.write_log(f'Dashboard generation exited with {proc.returncode}\n')
+
+            # fallback to common paths if script didn't report file
+            if not dashboard_file:
+                candidate = Path('data/combined_dashboard.html')
+                if candidate.exists():
+                    dashboard_file = str(candidate.resolve())
+                else:
+                    candidate2 = Path('data/trend_dashboard.html')
+                    if candidate2.exists():
+                        dashboard_file = str(candidate2.resolve())
+
+            if dashboard_file and Path(dashboard_file).exists():
+                self.write_log(f'Opening dashboard: {dashboard_file}\n')
+                webbrowser.open(f'file://{Path(dashboard_file).resolve()}')
+            else:
+                self.write_log('⚠️ Dashboard-Datei nicht gefunden.\n')
+        
+        threading.Thread(target=run, daemon=True).start()
+
+
+if __name__ == '__main__':
+    app = ScraperGUI()
+    app.mainloop()
